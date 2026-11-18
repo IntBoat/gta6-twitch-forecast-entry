@@ -9,9 +9,13 @@ Method: anchor every comparable launch on its own first hour, but keep only the
 launches whose first hour is a healthy share of their day (at least 15% of the
 day's peak). The rest have a first hour that predates any real unlock in UTC
 terms, so their ratios to it explode and say nothing about a normal launch.
-From the kept launches, each hour's log-ratio to hour 1 gives a median shape
-and a spread; the forecast is the case's own first-hour count carried along
-that shape, with normal quantiles at the measured spread.
+Weight the kept launches by how close their first-hour count is to this case's
+(a Gaussian kernel on the log counts): a launch watched by millions behaves
+more like this one than a launch watched by thousands. If the weights
+concentrate on too few launches (the effective sample size drops under 9),
+widen the kernel until they do not, so an unusually large case still borrows
+strength from the whole pool. Each hour's forecast is the weighted mean of the
+pool's log-ratios to hour 1, with normal quantiles at the weighted spread.
 
 Runs as `python3 -P -s /bot/main.py`, standard library only, no network, and
 deterministic: the same case always yields the same bytes.
@@ -36,7 +40,7 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 # hour is at least this share of its own day peak (a real anchor).
 MIN_DAY_HOURS = 20
 MIN_ANCHOR_SHARE = 0.15
-# An hour needs at least this many comparable ratios before its own median
+# An hour needs at least this many comparable ratios before its own centre
 # and spread are trusted; below that, the pooled shape fills in.
 MIN_HOUR_SAMPLES = 8
 # The spread used for an hour's quantiles is kept inside these bounds: a
@@ -44,6 +48,10 @@ MIN_HOUR_SAMPLES = 8
 # usually a few broken anchors rather than real uncertainty.
 SIGMA_FLOOR = 0.18
 SIGMA_CAP = 0.90
+# Width of the similarity kernel over log first-hour counts, and the least
+# effective sample size the weights may concentrate down to before widening.
+KERNEL_W = 0.75
+MIN_ESS = 9.0
 
 
 def parse(ts):
@@ -84,22 +92,31 @@ def comparable_pool(case):
     return pool
 
 
-def shape_and_spread(pool):
-    """Per forecast hour: (median log-ratio to hour 1, its spread)."""
+def pool_weights(pool, p1):
+    """Similarity weights for the pool, widened until they stay diverse."""
+    w = KERNEL_W
+    weights = []
+    for _ in range(6):
+        weights = [math.exp(-((math.log(dh[1]) - math.log(p1)) ** 2) / (2 * w * w))
+                   for dh in pool]
+        ess = sum(weights) ** 2 / sum(x * x for x in weights)
+        if ess >= MIN_ESS or w > 2.5:
+            break
+        w *= 1.4
+    return weights
+
+
+def shape_and_spread(pool, weights):
+    """Per forecast hour: (weighted mean log-ratio to hour 1, its spread)."""
     shape = {}
     for h in range(2, 25):
-        xs = [math.log(dh[h] / dh[1]) for dh in pool if h in dh]
+        xs = [(math.log(dh[h] / dh[1]), w) for dh, w in zip(pool, weights) if h in dh]
         if len(xs) >= MIN_HOUR_SAMPLES:
-            m = median(xs)
-            var = sum((x - m) ** 2 for x in xs) / len(xs)
-            sd = math.sqrt(var)
-            # Cross-check with the interquartile range: if the middle half of
-            # the launches spans wider than the standard deviation suggests,
-            # trust the wider reading; then bound the result.
-            xs_sorted = sorted(xs)
-            iqr = xs_sorted[3 * len(xs) // 4] - xs_sorted[len(xs) // 4]
-            sd = max(sd, 0.85 * iqr / 1.349)
-            shape[h] = (m, min(max(sd, SIGMA_FLOOR), SIGMA_CAP))
+            sw = sum(w for _, w in xs)
+            m = sum(x * w for x, w in xs) / sw
+            var = sum(w * (x - m) ** 2 for x, w in xs) / sw
+            sd = min(max(math.sqrt(var), SIGMA_FLOOR), SIGMA_CAP)
+            shape[h] = (m, sd)
     # Fill any thin hour from its neighbours so every hour has a forecast.
     for h in range(2, 25):
         if h not in shape:
@@ -123,7 +140,7 @@ def forecast_case(case, name):
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1.0, float(first["viewers"]))
     pool = comparable_pool(case)
-    shape = shape_and_spread(pool) if pool else {}
+    shape = shape_and_spread(pool, pool_weights(pool, p1)) if pool else {}
     rows = []
     for row in case["forecast"]:
         h = row["hour"]
